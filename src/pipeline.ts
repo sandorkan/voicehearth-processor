@@ -18,6 +18,7 @@ interface ProcessOptions {
   storyTitle: string
   readerName?: string
   musicTrack?: string
+  musicVolume?: number
   purchaseId: string
 }
 
@@ -40,7 +41,7 @@ async function markFailed(purchaseId: string, error: string) {
     .eq("id", purchaseId)
 }
 
-async function markCompleted(purchaseId: string, audioPath: string) {
+async function markCompleted(purchaseId: string, sessionId: string, audioPath: string) {
   const supabase = getSupabase()
   await supabase
     .from("purchases")
@@ -49,6 +50,12 @@ async function markCompleted(purchaseId: string, audioPath: string) {
       final_audio_url: audioPath,
     })
     .eq("id", purchaseId)
+
+  // Mark session as purchased so dashboard shows download state
+  await supabase
+    .from("recording_sessions")
+    .update({ status: "purchased" })
+    .eq("id", sessionId)
 }
 
 function runFfmpeg(command: Ffmpeg.FfmpegCommand): Promise<void> {
@@ -70,7 +77,7 @@ function getAudioDuration(filePath: string): Promise<number> {
 }
 
 export async function processRecording(options: ProcessOptions): Promise<string> {
-  const { sessionId, storyTitle, readerName, musicTrack, purchaseId } = options
+  const { sessionId, storyTitle, readerName, musicTrack, musicVolume = 0.15, purchaseId } = options
   const supabase = getSupabase()
   const tmpDir = path.join("/tmp", sessionId)
 
@@ -127,17 +134,29 @@ export async function processRecording(options: ProcessOptions): Promise<string>
     // --- Step 2: Generate silence and concat ---
     await updateStep(purchaseId, "stitching")
 
+    // Generate silence WAV directly (avoids lavfi dependency)
     const silencePath = path.join(tmpDir, "silence.wav")
-    await runFfmpeg(
-      Ffmpeg()
-        .input("anullsrc=r=44100:cl=mono")
-        .inputFormat("lavfi")
-        .duration(PAGE_GAP_SECONDS)
-        .audioChannels(1)
-        .audioFrequency(44100)
-        .format("wav")
-        .output(silencePath)
-    )
+    const sampleRate = 44100
+    const numSamples = Math.floor(sampleRate * PAGE_GAP_SECONDS)
+    const dataSize = numSamples * 2 // 16-bit mono = 2 bytes per sample
+    const headerSize = 44
+    const wavBuffer = Buffer.alloc(headerSize + dataSize) // zeros = silence
+    // WAV header
+    wavBuffer.write("RIFF", 0)
+    wavBuffer.writeUInt32LE(36 + dataSize, 4)
+    wavBuffer.write("WAVE", 8)
+    wavBuffer.write("fmt ", 12)
+    wavBuffer.writeUInt32LE(16, 16) // chunk size
+    wavBuffer.writeUInt16LE(1, 20) // PCM
+    wavBuffer.writeUInt16LE(1, 22) // mono
+    wavBuffer.writeUInt32LE(sampleRate, 24)
+    wavBuffer.writeUInt32LE(sampleRate * 2, 28) // byte rate
+    wavBuffer.writeUInt16LE(2, 32) // block align
+    wavBuffer.writeUInt16LE(16, 34) // bits per sample
+    wavBuffer.write("data", 36)
+    wavBuffer.writeUInt32LE(dataSize, 40)
+    // Data bytes are already zero (silence)
+    fs.writeFileSync(silencePath, wavBuffer)
 
     // Build concat file list
     const concatListPath = path.join(tmpDir, "concat.txt")
@@ -161,24 +180,21 @@ export async function processRecording(options: ProcessOptions): Promise<string>
         .output(concatenatedPath)
     )
 
-    // --- Step 3: Apply audio filters (highpass + loudnorm) ---
+    // --- Step 3: Apply highpass filter (remove low-frequency rumble) ---
     await updateStep(purchaseId, "polishing")
 
-    const polishedPath = path.join(tmpDir, "polished.wav")
+    const filteredPath = path.join(tmpDir, "filtered.wav")
     await runFfmpeg(
       Ffmpeg(concatenatedPath)
-        .audioFilters([
-          "highpass=f=80",
-          "loudnorm=I=-16:TP=-1.5:LRA=11",
-        ])
+        .audioFilters(["highpass=f=80"])
         .audioChannels(1)
         .audioFrequency(44100)
         .format("wav")
-        .output(polishedPath)
+        .output(filteredPath)
     )
 
     // --- Step 4: Mix background music (if selected) ---
-    let inputForEncode = polishedPath
+    let inputForNormalize = filteredPath
 
     if (musicTrack) {
       await updateStep(purchaseId, "mixing_music")
@@ -193,16 +209,16 @@ export async function processRecording(options: ProcessOptions): Promise<string>
         fs.writeFileSync(musicPath, musicBuffer)
 
         // Get voice duration to know how long to make the mix
-        const voiceDuration = await getAudioDuration(polishedPath)
+        const voiceDuration = await getAudioDuration(filteredPath)
 
         const mixedPath = path.join(tmpDir, "mixed.wav")
         await runFfmpeg(
           Ffmpeg()
-            .input(polishedPath)
+            .input(filteredPath)
             .input(musicPath)
             .complexFilter([
               // Loop music if shorter, trim to voice length, fade in/out
-              `[1:a]aloop=loop=-1:size=2e+09,atrim=duration=${voiceDuration},afade=t=in:st=0:d=3,afade=t=out:st=${Math.max(0, voiceDuration - 5)}:d=5,volume=0.1[music]`,
+              `[1:a]aloop=loop=-1:size=2e+09,atrim=duration=${voiceDuration},afade=t=in:st=0:d=3,afade=t=out:st=${Math.max(0, voiceDuration - 5)}:d=5,volume=${musicVolume}[music]`,
               // Mix voice (full volume) with quiet music
               `[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[out]`,
             ])
@@ -212,10 +228,23 @@ export async function processRecording(options: ProcessOptions): Promise<string>
             .format("wav")
             .output(mixedPath)
         )
-        inputForEncode = mixedPath
+        inputForNormalize = mixedPath
       }
       // If music download fails, continue without music
     }
+
+    // --- Step 4b: Normalize final audio (loudnorm on the complete mix) ---
+    const normalizedPath = path.join(tmpDir, "normalized.wav")
+    await runFfmpeg(
+      Ffmpeg(inputForNormalize)
+        .audioFilters(["loudnorm=I=-18:TP=-1.5:LRA=11"])
+        .audioChannels(1)
+        .audioFrequency(44100)
+        .format("wav")
+        .output(normalizedPath)
+    )
+
+    const inputForEncode = normalizedPath
 
     // --- Step 5: Encode to MP3 ---
     await updateStep(purchaseId, "encoding")
@@ -257,7 +286,7 @@ export async function processRecording(options: ProcessOptions): Promise<string>
     }
 
     // Mark as completed
-    await markCompleted(purchaseId, outputStoragePath)
+    await markCompleted(purchaseId, sessionId, outputStoragePath)
 
     return outputStoragePath
   } catch (error) {

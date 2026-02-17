@@ -32,7 +32,7 @@ app.get("/health", (_req, res) => {
 
 // Process recording
 app.post("/process", authenticate, async (req, res) => {
-  const { sessionId, storyTitle, readerName, musicTrack, purchaseId } = req.body
+  const { sessionId, storyTitle, readerName, musicTrack, musicVolume, purchaseId } = req.body
 
   if (!sessionId || !storyTitle || !purchaseId) {
     res.status(400).json({
@@ -51,6 +51,7 @@ app.post("/process", authenticate, async (req, res) => {
       storyTitle,
       readerName,
       musicTrack,
+      musicVolume,
       purchaseId,
     })
     console.log(`Completed processing for session ${sessionId}: ${audioPath}`)
